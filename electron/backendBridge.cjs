@@ -13,6 +13,7 @@ const fs = require('fs');
 const { resolveProjectRoot } = require('./fsBridge.cjs');
 // settings.json 的读写只有这一个入口（串行 + 原子写）。见 electron/settings.cjs 顶部注释。
 const { readSettings, writeSettings } = require('./settings.cjs');
+const { drainBackend } = require('./backendLifecycle.cjs');
 
 const isDev = !app.isPackaged;
 
@@ -43,7 +44,6 @@ const AGENT_DIR = path.join(BACKEND_DIR, 'agent');
 const RPC_METHODS = require('./backend-rpc-methods.json');
 const RPC_METHOD_SET = new Set(RPC_METHODS);
 const RPC_NOTIFICATIONS = new Set(['task.event', 'run.event']);
-const BACKEND_STOP_TIMEOUT_MS = 10_000;
 
 /** @type {import('child_process').ChildProcess | null} */
 let child = null;
@@ -51,6 +51,7 @@ let lifecycle = Promise.resolve();
 let nextId = 1;
 /** @type {Map<number, {resolve: Function, reject: Function}>} */
 const pending = new Map();
+const activeCalls = new Set();
 /** @type {() => import('electron').BrowserWindow | null} */
 let getWindow = () => null;
 
@@ -432,19 +433,16 @@ async function startNow({ workspace, agentId } = {}, { force = false } = {}) {
     return;
   }
 
-  const stopping = stopChild();
-  // 先记下目标配置，再置 starting —— setStatus 会把 workspace 一起播给渲染层，
-  // 早一步记下，界面在「启动中」阶段就能显示 agent 即将写入哪个目录。
-  currentConfig = { workspace: resolvedWorkspace, agentId: resolvedAgentId };
   setStatus('starting');
   try {
     // PGlite 不允许两个进程同时打开同一数据目录。必须等旧 BCD 完成资源关闭后再启动，
     // 不能只发出终止信号就立刻 spawn 新进程。
-    await stopping;
+    await stopChild();
   } catch (err) {
-    setStatus('error', `无法停止旧 BCD 后端：${err.message}`);
-    return;
+    throw new Error(`无法停止旧 BCD 后端：${err.message}`, { cause: err });
   }
+  currentConfig = { workspace: resolvedWorkspace, agentId: resolvedAgentId };
+  setStatus('starting');
 
   // agent 的写工具（ACP fs/write_text_file）不会 mkdir 工作区本身 —— 目录不存在时
   // 它的 edit 调用直接失败，最终表现为一个语焉不详的 DRIVER_FAILED。这里先建好。
@@ -509,6 +507,8 @@ async function startNow({ workspace, agentId } = {}, { force = false } = {}) {
     ACP_DRIVER_ENV_FILE: path.join(stateDir, 'driver.env'),
     ACP_AGENT_ID: resolvedAgentId,
     ACP_WORKSPACE: resolvedWorkspace,
+    CLAUDE_CONFIG_DIR: path.join(stateDir, 'claude-config'),
+    NEWIDE_EPHEMERAL_ACP_SESSIONS: '0',
     ...auth.set,
   };
   // Embedding 的凭据与对话模型完全分开：litellm/client.ts 的 openai 嵌入分支只认
@@ -593,103 +593,52 @@ async function startNow({ workspace, agentId } = {}, { force = false } = {}) {
 
   // 健康检查：ping 通了才算 ready，避免渲染层对着一个死后端发请求。
   // 这里必须用 send（裸发），不能用 call —— call 会等 ready，而 ready 正由这次 ping 决定。
-  send('system.ping')
-    .then((res) => {
-      if (isCurrent()) setStatus('ready', `protocol ${res?.protocol_version ?? '?'}`);
-    })
-    .catch((err) => {
-      if (isCurrent()) {
-        setStatus('error', `BCD 无响应：${err.message}${stderrTail ? `\n${stderrTail}` : ''}`);
-      }
-    });
+  try {
+    const res = await send('system.ping');
+    const readiness = await send('system.readiness', {});
+    if (!isCurrent()) return;
+    if (!['operational', 'partial'].includes(readiness?.service?.status)) {
+      throw new Error('后端 readiness 不可用，请检查运行配置。');
+    }
+    setStatus('ready', `protocol ${res?.protocol_version ?? '?'}`);
+  } catch (err) {
+    if (isCurrent()) {
+      setStatus('error', `BCD 无响应：${err.message}${stderrTail ? `\n${stderrTail}` : ''}`);
+    }
+  }
 }
 
 function start(options = {}, control = {}) {
   const operation = lifecycle.then(() => startNow(options, control));
-  lifecycle = operation.catch(() => {});
+  lifecycle = operation.catch((error) => console.error('[backend] 启动失败：', error));
   return operation;
 }
 
-function forceStopProcessTree(dying) {
-  try {
-    if (process.platform === 'win32' && dying.pid) {
-      const killer = spawn('taskkill', ['/T', '/F', '/PID', String(dying.pid)], {
-        stdio: 'ignore',
-      });
-      killer.on('error', () => dying.kill());
-      killer.on('exit', (code) => {
-        if (code && dying.exitCode === null) dying.kill();
-      });
-    } else if (dying.pid) {
-      process.kill(-dying.pid, 'SIGKILL');
-    } else {
-      dying.kill('SIGKILL');
-    }
-  } catch {
-    dying.kill('SIGKILL');
-  }
-}
-
-function stopChild() {
+async function stopChild() {
   if (!child) {
     currentConfig = null;
-    return Promise.resolve();
+    return;
   }
   const dying = child;
-  child = null;
-  currentConfig = null;
-
-  // 未响应的调用必须当场拒绝。
-  //
-  // 不能指望子进程的 exit handler 来做这件事：那个 handler 一开头就是 `if (!isCurrent()) return`，
-  // 而 stopChild() 已经把 child 置空、start() 随后又把 child 指向新进程 —— 等旧进程的 exit
-  // 真正到达时 isCurrent() 早就是 false 了，拒绝逻辑被整段跳过。
-  // 结果是调用方挂满 60 秒，最后拿到一句驴唇不对马嘴的「RPC 超时」，而真相是「后端被重启了」。
-  for (const { reject } of pending.values()) {
-    reject(new Error('BCD 后端已重启或退出，本次调用未完成'));
+  setStatus('starting', '正在停止并保存任务');
+  const inFlight = [...activeCalls];
+  try {
+    await drainBackend(dying, async (method, params) => {
+      if (method === 'task.list') await Promise.allSettled(inFlight);
+      return send(method, params);
+    });
+  } catch (error) {
+    setStatus(child === dying ? 'ready' : 'error', `安全关闭未完成：${error.message}`);
+    throw error;
   }
-  pending.clear();
-
-  return new Promise((resolve, reject) => {
-    let forceTimer;
-    let failureTimer;
-    let settled = false;
-    const finish = (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(forceTimer);
-      clearTimeout(failureTimer);
-      dying.off('exit', onExit);
-      if (error) reject(error);
-      else resolve();
-    };
-    const onExit = () => finish();
-    dying.once('exit', onExit);
-
-    // 关闭 stdin 会让 BCD 的 readline 收到 EOF，依次关闭 driver、PGlite 和 SQLite。
-    // 若清理卡住，再强制杀整棵进程树，避免留下仍向旧工作区写入的 agent。
-    try {
-      if (dying.stdin?.writable) dying.stdin.end();
-      else forceStopProcessTree(dying);
-    } catch {
-      forceStopProcessTree(dying);
-    }
-
-    forceTimer = setTimeout(() => {
-      forceStopProcessTree(dying);
-      failureTimer = setTimeout(
-        () => finish(new Error(`等待进程退出超过 ${BACKEND_STOP_TIMEOUT_MS + 2_000}ms`)),
-        2_000,
-      );
-    }, BACKEND_STOP_TIMEOUT_MS);
-
-    if (dying.exitCode !== null || dying.signalCode !== null) finish();
-  });
+  if (child === dying) child = null;
+  currentConfig = null;
+  setStatus('stopped', '后端已保存并退出');
 }
 
 function stopBackend() {
   const operation = lifecycle.then(() => stopChild());
-  lifecycle = operation.catch(() => {});
+  lifecycle = operation.catch((error) => console.error('[backend] 关闭失败：', error));
   return operation;
 }
 
@@ -713,8 +662,18 @@ async function call(method, params) {
   if (!RPC_METHOD_SET.has(method)) {
     throw new Error(`未授权的 RPC 方法：${method}`);
   }
+  const expected = status.state === 'ready' ? child : null;
   await waitForReady();
-  return send(method, params);
+  if (status.state !== 'ready' || !child || (expected && child !== expected)) {
+    throw new Error('后端连接已变化，请等待任务状态同步后重试。');
+  }
+  const request = send(method, params);
+  activeCalls.add(request);
+  try {
+    return await request;
+  } finally {
+    activeCalls.delete(request);
+  }
 }
 
 function setupBackendBridge(windowGetter) {
@@ -866,14 +825,17 @@ function setupBackendBridge(windowGetter) {
     if (quitInProgress) return;
     quitInProgress = true;
     void stopBackend()
-      .catch((err) => console.error(`[backend] 关闭失败：${err.message}`))
-      .finally(() => {
+      .then(() => {
         quitAfterBackendStops = true;
         app.quit();
+      })
+      .catch((err) => {
+        quitInProgress = false;
+        require('electron').dialog.showErrorBox('无法安全退出', err.message);
       });
   });
 
-  void start({});
+  void start({}).catch((error) => setStatus('error', error.message));
 }
 
 module.exports = { setupBackendBridge, stopBackend };

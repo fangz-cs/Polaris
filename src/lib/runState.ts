@@ -18,6 +18,7 @@ export type RunState =
   | 'completed'
   | 'failed'
   | 'cancelled'
+  | 'interrupted'
   | 'unsent';
 
 /** 唯一的中文词表。别处不许再写第二份。 */
@@ -29,6 +30,7 @@ export const RUN_STATE_LABEL: Record<RunState, string> = {
   completed: '已交付',
   failed: '失败',
   cancelled: '已取消',
+  interrupted: '已中断',
   unsent: '未提交到后端',
 };
 
@@ -41,6 +43,7 @@ export const RUN_STATE_TONE: Record<RunState, 'muted' | 'command' | 'human' | 'o
   completed: 'ok',
   failed: 'danger',
   cancelled: 'muted',
+  interrupted: 'human',
   unsent: 'danger',
 };
 
@@ -80,6 +83,7 @@ export function runStateOf(task: DemoTask | undefined, live: LiveRunState | unde
   if (taskStatus === 'completed') return 'completed';
   if (taskStatus === 'failed') return 'failed';
   if (taskStatus === 'cancelled') return 'cancelled';
+  if (taskStatus === 'blocked' && live.status === 'interrupted') return 'interrupted';
   if (['blocked', 'waiting_input', 'pending_gate', 'escalated'].includes(taskStatus ?? ''))
     return 'blocked';
   if (taskStatus === 'waiting_help') return 'waiting';
@@ -99,6 +103,8 @@ export function runStateOf(task: DemoTask | undefined, live: LiveRunState | unde
       return 'failed';
     case 'cancelled':
       return 'cancelled';
+    case 'interrupted':
+      return 'interrupted';
     case 'running':
       return BLOCKING_GATE_DECISIONS.has(latestGateDecision(live.timeline)) ? 'blocked' : 'running';
   }

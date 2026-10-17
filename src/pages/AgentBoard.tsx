@@ -46,7 +46,7 @@ import { cn } from '@/lib/utils';
  * 先随便选中一个 Agent 才点得到 —— 旧的空状态提示里那句「新建 Agent 的入口在生命周期标签页，
  * 而那一页要先选中一个 Agent 才打得开」就是这个毛病的自白。
  *
- * 能力门控读 v2 的 `capabilities.operations`（33 个键，键名与 RPC 方法名并非一一对应：
+ * 能力门控读 v2/v4 的 `capabilities.operations`（键名与 RPC 方法名并非一一对应：
  * 晋升是 `promote_skills`，详情是 `get_agent_persona`，上架是 `publish_skill`）。清单没回来
  * 之前不预设可用；后端说 unavailable 就把它给的 reason 原样摆出来，不画一个按下去必然报错的按钮。
  */
@@ -586,7 +586,14 @@ function OverviewTab({
               v={`技能 ${numText(agent.skill_count)} · 经验 ${numText(agent.experience_count)} · 平均置信 ${fixed2(raw.avg_confidence)}`}
             />
             <KeyValue k="最近任务" v={raw.last_task_at ?? '后端未给出'} />
-            <KeyValue k="开销" v={`累计 ${numText(raw.token_cost_total)} token`} />
+            <KeyValue
+              k="开销"
+              v={
+                typeof raw.token_cost_total === 'number'
+                  ? `累计 ${numText(raw.token_cost_total)} token`
+                  : '用量暂不可用'
+              }
+            />
           </KeyValueList>
         </div>
       </Panel>

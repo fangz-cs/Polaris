@@ -232,6 +232,15 @@ export function missionLineOf({
         retry: false,
       };
 
+    case 'interrupted':
+      return {
+        state,
+        headline: '已中断 · 可尝试继续',
+        sub:
+          task?.contractWaitingReason || '已保存的恢复资源由后端校验；继续时可能回写工作区文件。',
+        retry: false,
+      };
+
     case 'blocked': {
       const gate = gateBlock(live);
       return {

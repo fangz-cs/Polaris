@@ -26,6 +26,7 @@ test('serializes restarts, preserves API authentication and reports B Memory set
     proc.pid = 10_000 + processes.length;
     proc.exitCode = null;
     proc.signalCode = null;
+    proc.requests = [];
     proc.stdout = new PassThrough();
     proc.stderr = new PassThrough();
     proc.stdin = {
@@ -33,12 +34,26 @@ test('serializes restarts, preserves API authentication and reports B Memory set
       ended: false,
       write(line) {
         const request = JSON.parse(String(line));
-        queueMicrotask(() => {
+        proc.requests.push(request);
+        queueMicrotask(async () => {
+          let result;
+          if (request.method === 'system.ping') result = { protocol_version: 'test' };
+          else if (request.method === 'system.readiness') {
+            result = { service: { status: 'operational' } };
+          } else if (request.method === 'task.list') {
+            result = { tasks: [{ task: { task_id: 'active-task' }, current_run: {} }] };
+          } else if (request.method === 'task.interrupt') {
+            await proc.interruptWait;
+            result = { task: { task_id: 'active-task', status: 'blocked' } };
+          } else if (request.method === 'task.create') {
+            await proc.createWait;
+            result = { task: { task_id: 'active-task', status: 'executing' }, current_run: {} };
+          } else assert.fail(`Unexpected RPC: ${request.method}`);
           proc.stdout.write(
             `${JSON.stringify({
               jsonrpc: '2.0',
               id: request.id,
-              result: { protocol_version: 'test' },
+              result,
             })}\n`,
           );
         });
@@ -136,6 +151,8 @@ test('serializes restarts, preserves API authentication and reports B Memory set
   assert.equal(env.NEWIDE_LLM_PROVIDER, 'anthropic');
   assert.equal(env.NEWIDE_LLM_CREDENTIALLESS, undefined);
   assert.equal(env.POLARIS_MODEL_PROXY_BASE_URL, undefined);
+  assert.equal(env.NEWIDE_EPHEMERAL_ACP_SESSIONS, '0');
+  assert.ok(env.CLAUDE_CONFIG_DIR.endsWith('backend-state/rpc-v1/claude-config'));
   const publicSettings = await handlers.get('backend:getSettings')();
   assert.equal(publicSettings.provider, 'anthropic');
   assert.equal(publicSettings.configured.anthropic.hasKey, true);
@@ -149,7 +166,35 @@ test('serializes restarts, preserves API authentication and reports B Memory set
     model: 'custom-model',
     fastModel: 'custom-fast-model',
   };
+  let confirmInterrupt;
+  processes[0].interruptWait = new Promise((resolve) => {
+    confirmInterrupt = resolve;
+  });
+  let finishCreate;
+  processes[0].createWait = new Promise((resolve) => {
+    finishCreate = resolve;
+  });
+  const creating = handlers.get('backend:call')(null, { method: 'task.create', params: {} });
+  await new Promise(setImmediate);
   const restart = handlers.get('backend:restart')();
+  const racingCreate = handlers.get('backend:call')(null, { method: 'task.create', params: {} });
+  await new Promise(setImmediate);
+  assert.equal(processes[0].stdin.ended, false, 'closed before interruption was confirmed');
+  assert.equal((await racingCreate).ok, false);
+  assert.equal(
+    processes[0].requests.filter((request) => request.method === 'task.create').length,
+    1,
+  );
+  assert.equal(
+    processes[0].requests.some((request) => request.method === 'task.list'),
+    false,
+  );
+  finishCreate();
+  assert.equal((await creating).ok, true);
+  await new Promise(setImmediate);
+  assert.equal(processes[0].requests.at(-1).method, 'task.interrupt');
+  assert.equal(processes[0].stdin.ended, false);
+  confirmInterrupt();
   await new Promise(setImmediate);
   assert.equal(processes[0].stdin.ended, true);
   assert.equal(processes.length, 1, 'replacement spawned before the old backend exited');

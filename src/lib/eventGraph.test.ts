@@ -21,6 +21,13 @@ const event = (type: string, payload: Record<string, unknown> = {}): RunEvent =>
 const stepOfNode = (nodeId: string) => nodeId.slice('step-'.length).split('|')[0];
 
 describe('eventGraph · council 事件归桶', () => {
+  it('does not mark an interrupted execution or delivery as successfully done', () => {
+    const { nodes } = buildEventGraph(
+      [event('agent.execution_requested'), event('run.interrupted')],
+      'interrupted',
+    );
+    expect(nodes.map((node) => node.status)).toEqual(['blocked', 'blocked']);
+  });
   it('a completed Mailbox leg does not create a delivered step', () => {
     const { nodes } = buildEventGraph(
       [

@@ -12,11 +12,11 @@
  * Agent 执行是一个跨度（requested→completed）；其间的 driver 生命周期归入同一步，
  * 不因工具调用完成就提前结束父级 Agent 步骤。
  */
-import type { RunEvent } from '@/api/types/rpc';
+import type { RunEvent, RunStatus } from '@/api/types/rpc';
 import type { PhaseKey } from '@/data/workflow';
 import type { Lane, NodeDirection, NodeTier, WorkflowNodeData, WorkflowNodeStatus } from '@/types';
 
-export type LiveRunStatus = 'running' | 'completed' | 'failed' | 'cancelled';
+export type LiveRunStatus = RunStatus;
 
 /** 一个步骤背后的原始事件（Inspector 里逐条可查，一条不丢） */
 export type EventGroup = {
@@ -171,6 +171,7 @@ function stepOf(event: RunEvent): StepKey | undefined {
     case 'artifact.delivered':
     case 'run.failed':
     case 'run.cancelled':
+    case 'run.interrupted':
       return 'deliver';
 
     case 'proxy.llm_usage_recorded':
@@ -387,6 +388,7 @@ function roleKeyOf(group: EventGroup): string {
 
 function statusOf(group: EventGroup, runStatus: LiveRunStatus): WorkflowNodeStatus {
   if (group.open) return runStatus === 'running' ? 'active' : 'blocked';
+  if (group.events.some((event) => event.type === 'run.interrupted')) return 'blocked';
   const executionResult = [...group.events]
     .reverse()
     .find(
