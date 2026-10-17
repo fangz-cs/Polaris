@@ -120,6 +120,42 @@ const FILL_PROMOTED_FROM_SQL = `
     AND target.promoted_from IS NULL;
 `;
 
+async function migratePayloadOnlyVectors(
+  pool: SqlPool,
+  table: 'memory_skills' | 'memory_experiences',
+  dimensions: number,
+): Promise<void> {
+  // Older desktop databases kept vectors only in JSON. Add and backfill atomically;
+  // existing vector columns, including dimension changes awaiting reindex, stay untouched.
+  await pool.query(`
+    DO $migration$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = '${table}'::regclass
+          AND attname = 'description_embedding' AND NOT attisdropped
+      ) THEN
+        ALTER TABLE ${table}
+          ADD COLUMN IF NOT EXISTS description_embedding vector(${dimensions});
+        UPDATE ${table}
+        SET description_embedding = (payload->>'description_embedding')::vector
+        WHERE description_embedding IS NULL
+          AND CASE WHEN jsonb_typeof(payload->'description_embedding') = 'array' THEN
+            jsonb_array_length(payload->'description_embedding') = ${dimensions}
+            AND NOT EXISTS (
+              SELECT 1
+              FROM jsonb_array_elements(payload->'description_embedding') AS entry(value)
+              WHERE CASE WHEN jsonb_typeof(entry.value) = 'number' THEN
+                abs(entry.value::text::numeric) > 3.4028234663852886e38
+              ELSE TRUE END
+            )
+          ELSE FALSE END;
+      END IF;
+    END
+    $migration$;
+  `);
+}
+
 export async function ensurePgMemorySchema(pool: SqlPool, dimensions: number): Promise<void> {
   if (!Number.isInteger(dimensions) || dimensions <= 0) {
     throw new Error(`Invalid embedding dimensions: ${dimensions}`);
@@ -213,6 +249,7 @@ export async function ensurePgMemorySchema(pool: SqlPool, dimensions: number): P
       promoted_from UUID
     );
   `);
+  await migratePayloadOnlyVectors(pool, 'memory_skills', dimensions);
 
   // 晋升幂等的锚点：一条经验最多对应一条技能。列与索引都对已存在的库做 IF NOT EXISTS
   // 迁移（列在 payload JSONB 里也有，这里是把它提升为一等公民好让唯一约束能生效）。
@@ -246,6 +283,7 @@ export async function ensurePgMemorySchema(pool: SqlPool, dimensions: number): P
       description_embedding vector(${dimensions}) NOT NULL
     );
   `);
+  await migratePayloadOnlyVectors(pool, 'memory_experiences', dimensions);
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS memory_experiences_role_id_idx

@@ -937,6 +937,120 @@ describe('PgMemoryRepository on embedded PGlite', () => {
   });
 });
 
+describe('payload-only desktop schema upgrades', () => {
+  it('restores skill and experience vector columns without changing persisted memory', async () => {
+    const pool = await createPGlitePool();
+    const embedding = new HashEmbeddingProvider();
+    const role_id = `role_legacy_${randomUUID()}`;
+    try {
+      const repository = new PgMemoryRepository({ pool, embedding });
+      await repository.initializeAgent({ role_id, name: 'Legacy Agent' });
+      await repository.saveSkill(role_id, createSkill(role_id));
+      await repository.saveExperience(role_id, createExperience(role_id));
+      const agent = await repository.getAgent(role_id);
+      const skills = await repository.listSkills(role_id);
+      const experiences = await repository.listExperiences(role_id);
+      const before = new Map<string, unknown[]>();
+      for (const table of ['memory_skills', 'memory_experiences']) {
+        before.set(
+          table,
+          (
+            await pool.query(
+              `SELECT id, payload, description_embedding::text AS vector FROM ${table} ORDER BY id`,
+            )
+          ).rows,
+        );
+        await pool.query(`ALTER TABLE ${table} DROP COLUMN description_embedding`);
+      }
+
+      await ensurePgMemorySchema(pool, embedding.dimensions);
+      await ensurePgMemorySchema(pool, embedding.dimensions);
+      for (const table of ['memory_skills', 'memory_experiences']) {
+        expect(
+          (
+            await pool.query(
+              `SELECT id, payload, description_embedding::text AS vector FROM ${table} ORDER BY id`,
+            )
+          ).rows,
+        ).toEqual(before.get(table));
+      }
+      const upgraded = new PgMemoryRepository({ pool, embedding });
+      await expect(upgraded.getAgent(role_id)).resolves.toEqual(agent);
+      await expect(upgraded.listSkills(role_id)).resolves.toEqual(skills);
+      await expect(upgraded.listExperiences(role_id)).resolves.toEqual(experiences);
+      await expect(
+        upgraded.searchSkills(role_id, {
+          query_embedding: skills[0]!.description_embedding,
+          top_k: 1,
+        }),
+      ).resolves.toMatchObject([{ id: skills[0]!.id }]);
+      await expect(
+        upgraded.searchExperiences(role_id, {
+          query_embedding: experiences[0]!.description_embedding,
+          top_k: 1,
+        }),
+      ).resolves.toMatchObject([{ id: experiences[0]!.id }]);
+      await expect(upgraded.saveSkill(role_id, createSkill(role_id))).resolves.toBeUndefined();
+      await expect(
+        upgraded.saveExperience(role_id, createExperience(role_id)),
+      ).resolves.toBeUndefined();
+      await pool.query(
+        'UPDATE memory_skills SET description_embedding = NULL WHERE id = $1::uuid',
+        [skills[0]!.id],
+      );
+      await ensurePgMemorySchema(pool, embedding.dimensions);
+      expect(
+        (
+          await pool.query('SELECT description_embedding FROM memory_skills WHERE id = $1::uuid', [
+            skills[0]!.id,
+          ])
+        ).rows,
+      ).toEqual([{ description_embedding: null }]);
+    } finally {
+      await pool.end();
+    }
+  });
+
+  it('preserves incompatible legacy payloads for explicit reindex instead of inventing vectors', async () => {
+    const pool = await createPGlitePool();
+    const embedding = new HashEmbeddingProvider();
+    const role_id = `role_legacy_invalid_${randomUUID()}`;
+    try {
+      const repository = new PgMemoryRepository({ pool, embedding });
+      await repository.initializeAgent({ role_id, name: 'Legacy Agent' });
+      await pool.query('ALTER TABLE memory_skills DROP COLUMN description_embedding');
+      for (const vector of [
+        [],
+        [0.1, 0.2],
+        'invalid',
+        [null],
+        Array(32).fill('invalid'),
+        Array(32).fill(1e100),
+      ]) {
+        const skill = { ...createSkill(role_id), description_embedding: vector };
+        await pool.query(
+          'INSERT INTO memory_skills (id, role_id, payload) VALUES ($1::uuid, $2, $3::jsonb)',
+          [skill.id, role_id, JSON.stringify(skill)],
+        );
+      }
+      const before = await pool.query('SELECT id, payload FROM memory_skills ORDER BY id');
+      await ensurePgMemorySchema(pool, embedding.dimensions);
+      expect((await pool.query('SELECT id, payload FROM memory_skills ORDER BY id')).rows).toEqual(
+        before.rows,
+      );
+      expect(
+        (
+          await pool.query(
+            'SELECT count(*)::int AS total FROM memory_skills WHERE description_embedding IS NULL',
+          )
+        ).rows,
+      ).toEqual([{ total: 6 }]);
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
 describe('PGlitePool dataDir persistence', () => {
   const embedding = new HashEmbeddingProvider();
   let tempDir: string;

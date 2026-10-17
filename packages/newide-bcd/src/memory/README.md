@@ -226,6 +226,11 @@ Persona 演化与 Agent 解耦：Agent 只读 `getPersona()`，演化由外部�
 默认嵌入实现是确定性的 `HashEmbeddingProvider`，用于本地开发和测试，
 不是语义嵌入模型。生产环境应通过 `PgMemoryRepository` 构造参数注入合适的 `EmbeddingProvider`。
 
+旧桌面版曾只把向量保存在载荷 JSONB 中，没有 `description_embedding` 列。升级时自动补列，
+并在同一条原子迁移中还原维度相符、可表示的既有向量，不删除或改写技能、经验载荷。
+缺失或不兼容的向量保留为空索引，可通过 `memory.reindex` 显式重建；不会补造占位向量，
+也不会在迁移时调用外部嵌入服务。已有向量列不受此兼容迁移影响。
+
 ### 文件 Buffer
 
 `FileBufferRepository({ agentStateRoot })` 使用以下布局：
