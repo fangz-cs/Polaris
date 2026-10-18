@@ -565,11 +565,30 @@ describe('TaskProcessor', () => {
       idempotency_key: 'run_mailbox_sender:reply:1',
     });
     const replyDeliveryId = replied.reply.deliveries[0]!.delivery_id;
+    expect(() =>
+      processor.beginRun({
+        task_id: 'task_mailbox_continue',
+        run_id: 'run_wrong_delivery_target',
+        task_request: taskRequest,
+        workspace_path: '/workspace/.newide/council/primary',
+        mode: 'single_agent',
+        restarted_from_run_id: 'run_mailbox_sender',
+        run_intent: {
+          type: 'mailbox_continuation',
+          source_delivery_id: sourceDeliveryId,
+        },
+        cursor_input: {
+          cursor: 'execute_agent',
+          winner_agent_id: 'agent_a',
+          mailbox_delivery_id: replyDeliveryId,
+        },
+      }),
+    ).toThrow(/definition cannot change/i);
     processor.beginRun({
       task_id: 'task_mailbox_continue',
       run_id: 'run_mailbox_continuation',
       task_request: taskRequest,
-      workspace_path: '/workspace/.newide/council/primary',
+      workspace_path: '/workspace',
       mode: 'single_agent',
       memory_ablation: 'B0',
       session_id: 'session_sender',
@@ -588,7 +607,7 @@ describe('TaskProcessor', () => {
     expect(processor.getRunExecutionState('run_mailbox_continuation')).toMatchObject({
       task_id: 'task_mailbox_continue',
       memory_ablation: 'B0',
-      workspace_path: '/workspace/.newide/council/primary',
+      workspace_path: '/workspace',
       resume_cursor: 'execute_agent',
       cursor_input: {
         winner_agent_id: 'agent_a',
@@ -598,8 +617,11 @@ describe('TaskProcessor', () => {
     const persisted = store.getTaskAggregate('task_mailbox_continue');
     expect(persisted?.task.workspace_path).toBe('/workspace');
     expect(persisted?.runs.find((run) => run.run_id === 'run_mailbox_continuation')).toMatchObject({
-      workspace_path: '/workspace/.newide/council/primary',
+      workspace_path: '/workspace',
     });
+    expect(processor.getTaskSnapshot('task_mailbox_continue').task.workspace_path).toBe(
+      '/workspace',
+    );
     expect(() =>
       processor.beginRun({
         task_id: 'task_mailbox_continue',

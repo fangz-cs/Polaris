@@ -15,6 +15,7 @@ export interface TaskRunFact extends TaskRunSummary {
 export interface ProjectTaskSnapshotInput {
   task_id: string;
   task_request: TaskCreateRequest;
+  workspace_path?: string;
   created_at: string;
   runs: readonly TaskRunFact[];
 }
@@ -50,6 +51,7 @@ export function projectTaskSnapshot(input: ProjectTaskSnapshotInput): TaskSnapsh
       spec: input.task_request.spec,
       completion_criteria: [...input.task_request.completion_criteria],
       affected_paths: [...(input.task_request.affected_paths ?? [])],
+      ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
       ...(input.task_request.budget ? { budget: { ...input.task_request.budget } } : {}),
       created_at: input.created_at,
       updated_at: updatedAt,

@@ -181,7 +181,11 @@ export class AcpConnection implements AgentConnection {
 
   async authenticate(methodId: string, authMethod: any): Promise<void> {
     if (!this.sdkConn) throw new TransportError("Not connected");
-    await this.sdkConn.authenticate({ methodId, authMethod });
+    await this.sdkConn.authenticate({
+      methodId,
+      authMethod,
+      ...(methodId === "gateway" ? { _meta: authMethod?._meta } : {}),
+    });
   }
 
   async createSession(cwd: string, mcpServers: McpServerConfig[] = []): Promise<SessionRecord> {

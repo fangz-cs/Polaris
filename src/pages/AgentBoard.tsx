@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertTriangle, Brain, Globe, Loader2, Sparkles, X } from 'lucide-react';
 import { memoryApi } from '@/api/memory';
+import { onBackendStatus } from '@/api/events';
 import type {
   MemoryCapabilities,
   MemoryMaintenanceEvidence,
@@ -195,24 +196,47 @@ export function AgentBoard() {
   }, []);
 
   useEffect(() => {
-    let active = true;
-    setLoading(true);
-    void Promise.all([memoryApi.getCapabilities(), memoryApi.listAgents()])
-      .then(([caps, listed]) => {
-        if (!active) return;
-        setCapabilities(caps.capabilities);
-        setAgents(listed.agents);
-      })
-      .catch((reason: unknown) => {
-        if (active) setError(errorMessage(reason));
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
+    let revision = 0;
+    const off = onBackendStatus((status) => {
+      const current = ++revision;
+      detailToken.current += 1;
+      setError(undefined);
+      if (status.state !== 'ready') {
+        setLoading(status.state === 'starting');
+        if (status.state !== 'starting') {
+          setAgents([]);
+          setError(status.message || 'BCD 后端未运行');
+        }
+        return;
+      }
+      setLoading(true);
+      void Promise.all([memoryApi.getCapabilities(), memoryApi.listAgents()])
+        .then(([caps, listed]) => {
+          if (current !== revision) return;
+          setCapabilities(caps.capabilities);
+          setAgents(listed.agents);
+          const selected = selectedRef.current;
+          if (selected && listed.agents.some((agent) => agent.role_id === selected)) {
+            void loadDetail(selected);
+          } else {
+            setSelectedRoleId(undefined);
+            setDetail(undefined);
+            setDetailLoading(false);
+          }
+        })
+        .catch((reason: unknown) => {
+          if (current === revision) setError(errorMessage(reason));
+        })
+        .finally(() => {
+          if (current === revision) setLoading(false);
+        });
+    });
     return () => {
-      active = false;
+      revision += 1;
+      detailToken.current += 1;
+      off();
     };
-  }, []);
+  }, [loadDetail]);
 
   useEffect(() => {
     if (!selectedRoleId) {

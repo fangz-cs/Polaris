@@ -66,6 +66,51 @@ function driverEventsBody(events: string): string {
 }
 
 describe('CommandDriverTransport', () => {
+  it.each([false, true])(
+    'binds concurrent child tool environments to their invocation workspaces (configured env=%s)',
+    async (configured) => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), 'driver-workspaces-'));
+      const project = path.join(root, 'project');
+      const sandboxes = [path.join(root, 'primary'), path.join(root, 'reviewer')];
+      for (const directory of [project, ...sandboxes]) await fs.mkdir(directory);
+      vi.stubEnv('ACP_WORKSPACE', project);
+      const transport = new CommandDriverTransport({
+        ...nodeCommand(`
+          const fs = require('node:fs');
+          const path = require('node:path');
+          readInput((raw) => {
+            const input = JSON.parse(raw);
+            fs.writeFileSync(path.join(process.env.ACP_WORKSPACE, 'proof.txt'), input.run_id);
+            const result = driverRunResult(input.task_id);
+            result.response = process.env.ACP_WORKSPACE;
+            process.stdout.write(JSON.stringify(result));
+          });
+        `),
+        ...(configured ? { env: { ACP_WORKSPACE: project } } : {}),
+      });
+      try {
+        const results = await Promise.all(
+          sandboxes.map((workspace_path, index) =>
+            transport.run({ ...PROMPT, run_id: `run_${String(index)}`, workspace_path }),
+          ),
+        );
+        expect(results.map((result) => result.response)).toEqual(sandboxes);
+        for (const [index, sandbox] of sandboxes.entries()) {
+          expect(await fs.readFile(path.join(sandbox, 'proof.txt'), 'utf8')).toBe(
+            `run_${String(index)}`,
+          );
+        }
+        await expect(fs.access(path.join(project, 'proof.txt'))).rejects.toThrow();
+        expect(process.env.ACP_WORKSPACE).toBe(project);
+        expect((await transport.run(PROMPT)).response).toBe(project);
+      } finally {
+        await transport.shutdown();
+        vi.unstubAllEnvs();
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it('sends DriverPrompt through stdin and returns DriverRunResult from stdout JSON', async () => {
     const transport = new CommandDriverTransport(
       nodeCommand(`

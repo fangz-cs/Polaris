@@ -1420,11 +1420,9 @@ export class NewideBackendService {
 
       const sourceDeliveryId = context.delivery_ids[0]!;
       const source = mailbox.getEnvelope(sourceDeliveryId);
-      // Council plan_first writes Mailbox messages from the council workspace,
-      // which can differ from the Task worktree. Continuation must resume in
-      // the same workspace the request was sent from, or startRun fails and
-      // the Task stays waiting_help forever.
-      const continuationWorkspace = source.message.workspace_path;
+      // Mailbox sessions stay in their execution sandbox; the Run must retain
+      // the Task's user workspace so gate/deliver never target that sandbox.
+      const continuationWorkspace = context.workspace_path;
       let reply = mailbox.findReplyDelivery(sourceDeliveryId, context.sender_role_id);
       if (
         !reply &&
@@ -1469,7 +1467,7 @@ export class NewideBackendService {
           try {
             await this.participantSessionProvisioner({
               task_id: source.message.task_id,
-              workspace_path: continuationWorkspace,
+              workspace_path: source.message.workspace_path,
               role_id: source.delivery.recipient_role_id,
               run_id: context.run_id,
             });
@@ -2106,7 +2104,10 @@ export class NewideBackendService {
     const history = await this.requestStore.listHistory();
     const registryRuns = this.registry.listSnapshots();
     const registryRunIds = new Set(registryRuns.map((run) => run.run_id));
-    const requestFacts = new Map<string, { task_request: TaskCreateRequest; created_at: string }>();
+    const requestFacts = new Map<
+      string,
+      { task_request: TaskCreateRequest; created_at: string; workspace_path?: string }
+    >();
     const runFacts = new Map<string, TaskRunFact[]>();
 
     for (const entry of history) {
@@ -2117,6 +2118,7 @@ export class NewideBackendService {
         requestFacts.set(entry.task_id, {
           task_request: entry.task_request,
           created_at: entry.created_at,
+          ...(entry.workspace_path ? { workspace_path: entry.workspace_path } : {}),
         });
       }
     }
@@ -2146,6 +2148,7 @@ export class NewideBackendService {
         task_id: taskId,
         task_request: request.task_request,
         created_at: request.created_at,
+        ...(request.workspace_path ? { workspace_path: request.workspace_path } : {}),
         runs: runFacts.get(taskId) ?? [],
       }),
     );

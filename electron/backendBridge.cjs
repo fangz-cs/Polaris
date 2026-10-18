@@ -14,6 +14,20 @@ const { resolveProjectRoot } = require('./fsBridge.cjs');
 // settings.json 的读写只有这一个入口（串行 + 原子写）。见 electron/settings.cjs 顶部注释。
 const { readSettings, writeSettings } = require('./settings.cjs');
 const { drainBackend } = require('./backendLifecycle.cjs');
+const { readModelProxyConfig, resolveModelProxyConfig } = require('./modelProxy.cjs');
+let resolvedProxy;
+const CREDENTIAL_ENV_NAMES = [
+  'NEWIDE_LLM_API_KEY',
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_PROFILE',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_USE_VERTEX',
+  'CLAUDE_CODE_USE_FOUNDRY',
+  'CLAUDE_CODE_USE_ANTHROPIC_AWS',
+  'CLAUDE_CODE_USE_MANTLE',
+];
 
 const isDev = !app.isPackaged;
 
@@ -48,6 +62,7 @@ const RPC_NOTIFICATIONS = new Set(['task.event', 'run.event']);
 /** @type {import('child_process').ChildProcess | null} */
 let child = null;
 let lifecycle = Promise.resolve();
+const expectedExits = new WeakSet();
 let nextId = 1;
 /** @type {Map<number, {resolve: Function, reject: Function}>} */
 const pending = new Map();
@@ -112,9 +127,18 @@ function waitForReady(timeoutMs = 30_000) {
     return Promise.reject(new Error(status.message || 'BCD 后端未运行'));
   }
   return new Promise((resolve, reject) => {
-    const waiter = { resolve, reject };
+    const waiter = {
+      resolve: () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    };
     readyWaiters.push(waiter);
-    setTimeout(() => {
+    const timer = setTimeout(() => {
       const i = readyWaiters.indexOf(waiter);
       if (i >= 0) {
         readyWaiters.splice(i, 1);
@@ -143,6 +167,18 @@ function pushNotification(method, params) {
  * 模型名会变（deepseek-v4-pro 之类），所以 defaults 只是预填，用户可改。
  */
 const PROVIDERS = [
+  {
+    id: 'local-proxy',
+    name: '本地代理测试（无凭据）',
+    keyLabel: '无需 API Key',
+    keyHint: '使用本机已登录的模型代理，不发送 API Key。',
+    consoleUrl: '',
+    consoleName: '',
+    baseUrl: '',
+    editableBaseUrl: true,
+    defaultModel: '',
+    defaultFastModel: '',
+  },
   {
     id: 'anthropic',
     name: 'Anthropic（官方）',
@@ -193,7 +229,7 @@ const AGENTS = [{ id: 'claude', name: 'Claude Code' }];
 function currentProvider() {
   const s = readSettings();
   const id = s.provider ?? 'anthropic';
-  const def = PROVIDERS.find((p) => p.id === id) ?? PROVIDERS[0];
+  const def = PROVIDERS.find((p) => p.id === id) ?? PROVIDERS.find((p) => p.id === 'anthropic');
   const cfg = s.providers?.[id] ?? {};
   return {
     def,
@@ -220,6 +256,33 @@ function providerComplete(p) {
 
 /** 认证是否就绪：配置完整，或本机已有登录态。 */
 function authState() {
+  try {
+    const proxy = readModelProxyConfig(readSettings());
+    if (proxy) {
+      return {
+        providerId: 'local-proxy',
+        hasKey: false,
+        incomplete: !resolvedProxy,
+        hasLocalCredentials: false,
+        ready: !!resolvedProxy,
+        baseUrl: proxy.root,
+        model: proxy.model,
+        fastModel: proxy.model,
+      };
+    }
+  } catch (error) {
+    return {
+      providerId: 'local-proxy',
+      hasKey: false,
+      incomplete: true,
+      hasLocalCredentials: false,
+      ready: false,
+      baseUrl: '',
+      model: '',
+      fastModel: '',
+      error: error.message,
+    };
+  }
   const p = currentProvider();
   const local = hasLocalCredentials();
   return {
@@ -244,6 +307,19 @@ function authState() {
  * 而且完全想不到是因为「本机还留着旧凭据」。
  */
 function readAuthEnv() {
+  if (resolvedProxy) {
+    return {
+      set: {
+        POLARIS_MODEL_PROXY_BASE_URL: resolvedProxy.root,
+        POLARIS_MODEL_PROXY_MODEL: resolvedProxy.model,
+        NEWIDE_LLM_PROVIDER: 'anthropic',
+        NEWIDE_LLM_MODEL: resolvedProxy.model,
+        NEWIDE_LLM_BASE_URL: resolvedProxy.apiBase,
+        NEWIDE_LLM_CREDENTIALLESS: '1',
+      },
+      unset: CREDENTIAL_ENV_NAMES,
+    };
+  }
   const p = currentProvider();
   if (!providerComplete(p) && !hasLocalCredentials()) return { set: {}, unset: [] };
 
@@ -437,7 +513,7 @@ async function startNow({ workspace, agentId } = {}, { force = false } = {}) {
   try {
     // PGlite 不允许两个进程同时打开同一数据目录。必须等旧 BCD 完成资源关闭后再启动，
     // 不能只发出终止信号就立刻 spawn 新进程。
-    await stopChild();
+    await stopChild({ restarting: true });
   } catch (err) {
     throw new Error(`无法停止旧 BCD 后端：${err.message}`, { cause: err });
   }
@@ -470,6 +546,13 @@ async function startNow({ workspace, agentId } = {}, { force = false } = {}) {
     return;
   }
 
+  try {
+    resolvedProxy = await resolveModelProxyConfig(readSettings());
+  } catch (error) {
+    resolvedProxy = undefined;
+    setStatus('error', `本地代理测试不可用：${error.message}`);
+    return;
+  }
   const auth = readAuthEnv();
   if (!authState().ready) {
     setStatus('error', '请先在设置中完成模型与认证配置。');
@@ -555,7 +638,9 @@ async function startNow({ workspace, agentId } = {}, { force = false } = {}) {
     }
     pending.clear();
     child = null;
-    if (status.state !== 'error') setStatus('stopped', `BCD 已退出（code=${code}）`);
+    if (!expectedExits.has(proc) && status.state !== 'error') {
+      setStatus('error', `BCD 意外退出（code=${code}）`);
+    }
   });
 
   let stderrTail = '';
@@ -600,7 +685,12 @@ async function startNow({ workspace, agentId } = {}, { force = false } = {}) {
     if (!['operational', 'partial'].includes(readiness?.service?.status)) {
       throw new Error('后端 readiness 不可用，请检查运行配置。');
     }
-    setStatus('ready', `protocol ${res?.protocol_version ?? '?'}`);
+    setStatus(
+      'ready',
+      resolvedProxy
+        ? `本地代理测试：${resolvedProxy.model}（无凭据）`
+        : `protocol ${res?.protocol_version ?? '?'}`,
+    );
   } catch (err) {
     if (isCurrent()) {
       setStatus('error', `BCD 无响应：${err.message}${stderrTail ? `\n${stderrTail}` : ''}`);
@@ -614,7 +704,7 @@ function start(options = {}, control = {}) {
   return operation;
 }
 
-async function stopChild() {
+async function stopChild({ restarting = false } = {}) {
   if (!child) {
     currentConfig = null;
     return;
@@ -622,6 +712,7 @@ async function stopChild() {
   const dying = child;
   setStatus('starting', '正在停止并保存任务');
   const inFlight = [...activeCalls];
+  expectedExits.add(dying);
   try {
     await drainBackend(dying, async (method, params) => {
       if (method === 'task.list') await Promise.allSettled(inFlight);
@@ -630,10 +721,12 @@ async function stopChild() {
   } catch (error) {
     setStatus(child === dying ? 'ready' : 'error', `安全关闭未完成：${error.message}`);
     throw error;
+  } finally {
+    expectedExits.delete(dying);
   }
   if (child === dying) child = null;
   currentConfig = null;
-  setStatus('stopped', '后端已保存并退出');
+  if (!restarting) setStatus('stopped', '后端已保存并退出');
 }
 
 function stopBackend() {
@@ -702,7 +795,7 @@ function setupBackendBridge(windowGetter) {
         ? 'environment'
         : 'pglite';
     return {
-      provider: s.provider ?? 'anthropic',
+      provider: authState().providerId,
       bMemory: {
         configured: databaseSource !== 'pglite',
         source: databaseSource,
@@ -719,6 +812,17 @@ function setupBackendBridge(windowGetter) {
       // 每个服务商各自的配置（key 一律只回布尔）
       configured: Object.fromEntries(
         PROVIDERS.map((p) => {
+          if (p.id === 'local-proxy') {
+            return [
+              p.id,
+              {
+                hasKey: false,
+                baseUrl: s.modelProxy?.baseUrl ?? '',
+                model: s.modelProxy?.model ?? '',
+                fastModel: s.modelProxy?.model ?? '',
+              },
+            ];
+          }
           const cfg = s.providers?.[p.id] ?? {};
           return [
             p.id,
@@ -743,8 +847,16 @@ function setupBackendBridge(windowGetter) {
   ipcMain.handle('backend:saveSettings', async (_event, next = {}) => {
     const current = readSettings();
     const providers = { ...(current.providers ?? {}) };
+    const modelProxy = { ...(current.modelProxy ?? {}) };
+    if (next.provider !== undefined) modelProxy.enabled = next.provider === 'local-proxy';
+    const proxyPatch = next.providers?.['local-proxy'];
+    if (proxyPatch) {
+      if (typeof proxyPatch.baseUrl === 'string') modelProxy.baseUrl = proxyPatch.baseUrl.trim();
+      if (typeof proxyPatch.model === 'string') modelProxy.model = proxyPatch.model.trim();
+    }
 
     for (const [id, patch] of Object.entries(next.providers ?? {})) {
+      if (id === 'local-proxy') continue;
       if (!PROVIDERS.some((p) => p.id === id)) continue; // 未知服务商：忽略，不写进配置
       const cfg = { ...(providers[id] ?? {}) };
       if (typeof patch.key === 'string') {
@@ -784,6 +896,7 @@ function setupBackendBridge(windowGetter) {
 
     await writeSettings({
       providers,
+      modelProxy,
       bMemory,
       embedding,
       provider: next.provider ?? current.provider ?? 'anthropic',

@@ -209,6 +209,12 @@ export async function createProductionBackendService(
     defaultEntryRelative: DRIVER_RUNNER_ENTRY_RELATIVE,
     baseEnv: {
       ...driverEnv,
+      ...(env.POLARIS_MODEL_PROXY_BASE_URL
+        ? { POLARIS_MODEL_PROXY_BASE_URL: env.POLARIS_MODEL_PROXY_BASE_URL }
+        : {}),
+      ...(env.POLARIS_MODEL_PROXY_MODEL
+        ? { POLARIS_MODEL_PROXY_MODEL: env.POLARIS_MODEL_PROXY_MODEL }
+        : {}),
       COREPACK_ENABLE_PROJECT_SPEC: env.COREPACK_ENABLE_PROJECT_SPEC ?? '0',
       PNPM_CONFIG_PM_ON_FAIL: env.PNPM_CONFIG_PM_ON_FAIL ?? 'ignore',
       ACP_WORKSPACE: env.ACP_WORKSPACE ?? path.join(stateRoot, 'test-workspace'),

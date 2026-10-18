@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -17,8 +17,220 @@ import type {
   AgentExecutionResult,
 } from '../../src/protocol/agent-execution';
 import type { AgentBoardListItem, AgentBoardQuery } from '../../src/memory';
+import { NewideBackendService } from '../../src/app/newide-backend-service';
+import { InMemoryRunRegistry } from '../../src/app/run-registry';
+import { FileRunRequestStore } from '../../src/app/run-request-store';
+import { FileRunAuditWriter } from '../../src/app/run-audit-writer';
+import { FileRunTerminalOutputWriter } from '../../src/app/run-terminal-output-writer';
+import { NoopDriverStreamAuditWriter } from '../../src/app/driver-stream-audit-writer';
+import { TaskExecutionLoop, TaskProcessor } from '../../src/coordination';
+import { FileRunEvidenceStore, SqliteCoordinationStore } from '../../src/persistence';
+import { MailboxDeliveryWorker, PersistentMailboxService } from '../../src/mailbox';
 
 describe('production stage executors', () => {
+  it.each([false, true])(
+    'delivers a Mailbox continuation to the user workspace, not its Council sandbox (restart=%s)',
+    async (restart) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), 'newide-mailbox-delivery-'));
+      const workspace = path.join(root, 'workspace');
+      const runsRoot = path.join(root, 'runs');
+      const database = path.join(root, 'coordination.sqlite');
+      await mkdir(workspace);
+      let store = new SqliteCoordinationStore(database);
+      let processor = new TaskProcessor(store, { runsRoot, mailboxStore: store });
+      let mailbox = new PersistentMailboxService(store);
+      let sourceDeliveryId = '';
+      let sandbox = '';
+      const requests: AgentExecutionRequest[] = [];
+      const provisionedWorkspaces: string[] = [];
+      const persistReply = async () => {
+        mailbox.markInjected(sourceDeliveryId, 'role_reviewer', 'session_reviewer');
+        await mailbox.reply({
+          source_delivery_id: sourceDeliveryId,
+          from_role_id: 'role_reviewer',
+          type: 'decision_response',
+          payload: { answer: 'Approved' },
+          requires_ack: false,
+          idempotency_key: 'review_reply',
+        });
+      };
+      const facade: AgentExecutionFacade = {
+        async runAgent(input) {
+          requests.push(input);
+          const result = planFirstScriptedResponse(input);
+          if (input.context_policy === 'council_primary_plan' && !sourceDeliveryId) {
+            sandbox = input.workspace_path!;
+            const sent = await mailbox.send({
+              task_id: input.task_id,
+              workspace_path: sandbox,
+              thread_id: input.task_id,
+              from_role_id: input.role_id,
+              to_role_id: 'role_reviewer',
+              type: 'review_request',
+              payload: { question: 'Review this plan' },
+              requires_ack: true,
+              deadline_seconds: 300,
+              idempotency_key: `${input.run_id}:review`,
+            });
+            sourceDeliveryId = sent.deliveries[0]!.delivery_id;
+            return {
+              ...result,
+              artifact_refs: [],
+              diagnostics: {
+                mailbox_outcomes: [
+                  {
+                    kind: 'request',
+                    wait_for_reply: true,
+                    delivery_id: sourceDeliveryId,
+                    to_role_id: 'role_reviewer',
+                  },
+                ],
+              },
+            };
+          }
+          return result;
+        },
+      };
+      const roles = ['role_primary', 'role_deputy', 'role_reviewer', 'role_synthesizer'];
+      const makeService = (recover: boolean) => {
+        const councilRoot = path.join(root, 'council');
+        const executors = createProductionStageExecutors({
+          selectAgentHandler: {
+            execute: async () => {
+              throw new Error('Test supplies the selected primary directly');
+            },
+          },
+          agentExecutionFacade: facade,
+          councilProvider: createCouncilStrategyProvider(
+            new SynthesisAgentCouncilProvider({
+              agentExecutionFacade: facade,
+              councilRoot,
+              participantResolver: new AgentBoardCouncilParticipantResolver({
+                boardQuery: boardQuery(roles.map((role) => boardAgent(role))),
+                allowedAgentIds: roles,
+                seatAssignments: {
+                  proposer0: roles[0]!,
+                  proposer1: roles[1]!,
+                  reviewer: roles[2]!,
+                  synthesizer: roles[3]!,
+                },
+              }),
+            }),
+            'plan_first',
+          ),
+          gateExecutor: {
+            execute: async () => ({
+              hook_point: 'task.completed',
+              matched: false,
+              gate_results: [],
+            }),
+          },
+          bootstrapAgentIds: roles,
+          runsRoot,
+          councilRoot,
+          worktreesRoot: path.join(root, 'worktrees'),
+        });
+        const loop = new TaskExecutionLoop({
+          processor,
+          evidence_store: new FileRunEvidenceStore({ root: runsRoot }),
+          executors: {
+            ...executors,
+            select_agent: {
+              execute: async () => ({
+                winner_agent_id: 'role_primary',
+                evidence: { winner_agent_id: 'role_primary' },
+              }),
+            },
+          },
+        });
+        return new NewideBackendService(
+          undefined,
+          new InMemoryRunRegistry(),
+          new FileRunAuditWriter(runsRoot),
+          new FileRunTerminalOutputWriter(runsRoot),
+          new FileRunRequestStore(runsRoot),
+          processor,
+          mailbox,
+          undefined,
+          undefined,
+          undefined,
+          new NoopDriverStreamAuditWriter(),
+          loop,
+          undefined,
+          recover ? new MailboxDeliveryWorker(mailbox, facade) : undefined,
+          async (input) => {
+            provisionedWorkspaces.push(input.workspace_path);
+            await persistReply();
+            return 'session_reviewer';
+          },
+        );
+      };
+      let service = makeService(false);
+      try {
+        const created = await service.createTask({
+          spec: 'Implement result.ts after collaborative review',
+          completion_criteria: [],
+          workspace_path: workspace,
+          mode: 'council',
+        });
+        await service.waitForTerminal(created.current_run!.run_id);
+        await service.close();
+        expect(processor.getTaskSnapshot(created.task.task_id).task).toMatchObject({
+          status: 'waiting_help',
+          workspace_path: workspace,
+        });
+        expect(sandbox).not.toBe(workspace);
+        if (restart) {
+          store.close();
+          store = new SqliteCoordinationStore(database);
+          processor = new TaskProcessor(store, { runsRoot, mailboxStore: store });
+          mailbox = new PersistentMailboxService(store);
+        }
+        if (restart) await persistReply();
+        service = makeService(true);
+        await service.recoverMailboxWaits();
+        const terminalTask = await service.waitForTaskTerminal(created.task.task_id);
+        await service.waitForTerminal(terminalTask.run_history[0]!.run_id);
+        await service.close();
+        const completed = processor.getTaskSnapshot(created.task.task_id);
+        expect(completed.task).toMatchObject({ status: 'completed', workspace_path: workspace });
+        const continuation = completed.run_history[0]!;
+        const request = await new FileRunRequestStore(runsRoot).load(continuation.run_id);
+        expect(request.workspace_path).toBe(workspace);
+        expect(request.recovery_parent_run_id).toBe(created.current_run!.run_id);
+        const resumed = requests.find((input) => input.mailbox_delivery_id);
+        expect(resumed?.workspace_path).toBe(sandbox);
+        expect(resumed?.resume_session).toBe(true);
+        expect(provisionedWorkspaces).toEqual(restart ? [] : [sandbox]);
+        const receipt = JSON.parse(
+          await readFile(path.join(runsRoot, continuation.run_id, 'delivery.json'), 'utf8'),
+        );
+        expect(receipt.workspace_path).toBe(workspace);
+        expect(receipt.files).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ file_path: path.join(workspace, 'src', 'result.ts') }),
+          ]),
+        );
+        expect(await readFile(path.join(workspace, 'src', 'result.ts'), 'utf8')).toBe(
+          'output for role_primary\n',
+        );
+        store.close();
+        store = new SqliteCoordinationStore(database);
+        const restored = new TaskProcessor(store, { runsRoot, mailboxStore: store });
+        expect(restored.getTaskSnapshot(created.task.task_id)).toMatchObject({
+          task: { status: 'completed', workspace_path: workspace },
+          final_output: {
+            files_written: expect.arrayContaining([path.join(workspace, 'src', 'result.ts')]),
+          },
+        });
+      } finally {
+        await service.close();
+        store.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it('retries a missing primary Plan and resumes a B_BLOCKED final Plan execution', async () => {
     const events: Event[] = [];
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-plan-first-stages-'));

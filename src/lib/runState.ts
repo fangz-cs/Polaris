@@ -79,11 +79,14 @@ export function runStateOf(task: DemoTask | undefined, live: LiveRunState | unde
 
   if (!live) return 'running';
 
+  if (live.status === 'failed') return 'failed';
+  if (live.status === 'cancelled') return 'cancelled';
+  if (live.status === 'interrupted') return 'interrupted';
+
   const taskStatus = task.contractTaskStatus ?? live.snapshot?.current?.task_status;
-  if (taskStatus === 'completed') return 'completed';
+  if (taskStatus === 'completed' && live.status === 'completed') return 'completed';
   if (taskStatus === 'failed') return 'failed';
   if (taskStatus === 'cancelled') return 'cancelled';
-  if (taskStatus === 'blocked' && live.status === 'interrupted') return 'interrupted';
   if (['blocked', 'waiting_input', 'pending_gate', 'escalated'].includes(taskStatus ?? ''))
     return 'blocked';
   if (taskStatus === 'waiting_help') return 'waiting';
@@ -99,12 +102,6 @@ export function runStateOf(task: DemoTask | undefined, live: LiveRunState | unde
   switch (live.status) {
     case 'completed':
       return taskStatus && taskStatus !== 'completed' ? 'running' : 'completed';
-    case 'failed':
-      return 'failed';
-    case 'cancelled':
-      return 'cancelled';
-    case 'interrupted':
-      return 'interrupted';
     case 'running':
       return BLOCKING_GATE_DECISIONS.has(latestGateDecision(live.timeline)) ? 'blocked' : 'running';
   }

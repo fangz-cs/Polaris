@@ -9,6 +9,7 @@ test('serializes restarts, preserves API authentication and reports B Memory set
   const handlers = new Map();
   const appHandlers = new Map();
   const processes = [];
+  const statuses = [];
   let appQuitCalls = 0;
   const settings = {
     provider: 'anthropic',
@@ -142,7 +143,13 @@ test('serializes restarts, preserves API authentication and reports B Memory set
     else process.env.NEWIDE_B_DATABASE_URL = originalDatabaseUrl;
   });
 
-  bridge.setupBackendBridge(() => null);
+  bridge.setupBackendBridge(() => ({
+    webContents: {
+      send(channel, payload) {
+        if (channel === 'backend:status') statuses.push(payload);
+      },
+    },
+  }));
   await new Promise(setImmediate);
   assert.equal(processes.length, 1);
   const env = processes[0].spawnOptions.env;
@@ -179,6 +186,7 @@ test('serializes restarts, preserves API authentication and reports B Memory set
   const restart = handlers.get('backend:restart')();
   const racingCreate = handlers.get('backend:call')(null, { method: 'task.create', params: {} });
   await new Promise(setImmediate);
+  const waitingForReady = handlers.get('backend:call')(null, { method: 'system.ping' });
   assert.equal(processes[0].stdin.ended, false, 'closed before interruption was confirmed');
   assert.equal((await racingCreate).ok, false);
   assert.equal(
@@ -201,6 +209,16 @@ test('serializes restarts, preserves API authentication and reports B Memory set
 
   processes[0].finish();
   await restart;
+  assert.equal(
+    (await waitingForReady).ok,
+    true,
+    'planned exit rejected a replacement readiness waiter',
+  );
+  assert.equal(
+    statuses.some((entry) => entry.state === 'stopped'),
+    false,
+    'normal replacement was broadcast as a stopped backend',
+  );
   assert.equal(processes.length, 2);
   const customEnv = processes[1].spawnOptions.env;
   assert.equal(customEnv.ANTHROPIC_API_KEY, undefined);
@@ -236,6 +254,46 @@ test('serializes restarts, preserves API authentication and reports B Memory set
     environmentConfigured: true,
   });
 
+  const originalFetch = global.fetch;
+  t.after(() => {
+    global.fetch = originalFetch;
+  });
+  global.fetch = async (url) => {
+    assert.equal(url, 'http://127.0.0.1:4143/accounts/test/v1/models');
+    return new Response(JSON.stringify({ data: [{ id: 'proxy-model' }] }));
+  };
+  settings.modelProxy = { baseUrl: 'http://127.0.0.1:4143/accounts/test', model: 'proxy-model' };
+  const localRestart = handlers.get('backend:restart')();
+  await new Promise(setImmediate);
+  processes[1].finish();
+  await localRestart;
+  assert.equal(processes.length, 3);
+  const localEnv = processes[2].spawnOptions.env;
+  assert.equal(localEnv.POLARIS_MODEL_PROXY_BASE_URL, settings.modelProxy.baseUrl);
+  assert.equal(localEnv.POLARIS_MODEL_PROXY_MODEL, 'proxy-model');
+  assert.equal(localEnv.NEWIDE_LLM_CREDENTIALLESS, '1');
+  assert.equal(localEnv.NEWIDE_LLM_API_KEY, undefined);
+  assert.equal(localEnv.ANTHROPIC_AUTH_TOKEN, undefined);
+  assert.equal(localEnv.ANTHROPIC_API_KEY, undefined);
+  const localStatus = handlers.get('backend:getStatus')();
+  assert.equal(localStatus.auth.providerId, 'local-proxy');
+  assert.equal(localStatus.auth.model, 'proxy-model');
+  assert.equal(localStatus.auth.ready, true);
+  assert.equal((await handlers.get('backend:getSettings')()).provider, 'local-proxy');
+
+  processes[2].finish();
+  const unexpectedExit = handlers.get('backend:getStatus')();
+  assert.equal(unexpectedExit.state, 'error');
+  assert.match(unexpectedExit.message, /意外退出.*code=0/);
+  assert.equal(
+    (await handlers.get('backend:call')(null, { method: 'system.ping' })).ok,
+    false,
+    'unexpected exits must remain explicit failures',
+  );
+  await handlers.get('backend:restart')();
+  assert.equal(processes.length, 4);
+  assert.equal(handlers.get('backend:getStatus')().state, 'ready');
+
   let quitPrevented = false;
   appHandlers.get('before-quit')({
     preventDefault() {
@@ -244,10 +302,10 @@ test('serializes restarts, preserves API authentication and reports B Memory set
   });
   await new Promise(setImmediate);
   assert.equal(quitPrevented, true);
-  assert.equal(processes[1].stdin.ended, true);
+  assert.equal(processes[3].stdin.ended, true);
   assert.equal(appQuitCalls, 0, 'app quit before the backend exited');
 
-  processes[1].finish();
+  processes[3].finish();
   await new Promise(setImmediate);
   assert.equal(appQuitCalls, 1);
 });

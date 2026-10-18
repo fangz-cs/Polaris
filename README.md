@@ -90,6 +90,12 @@ BCD 与 A 按各自上游 `main` 同步，本次同步基线为：
 
 保留桌面宿主所需的项目根注入、包内 Node 启动与打包适配。原生会话恢复失败会显式报错，不以新建会话冒充恢复；真实模型的单 Agent / 合议恢复及目标平台安装包仍需实机验收。
 
+此本地测试分支额外保留无凭据代理入口：已有的 `modelProxy.baseUrl` 和
+`modelProxy.model` 会作为本地测试路由，设置中显示“本地代理测试（无凭据）”。
+只允许 loopback 端点，启动前检查所选模型，不发送 API Key，
+代理不可用时显式报错而不回退到官方服务。显式选择其他服务商会关闭代理模式。
+该测试分支与正式 API 认证的 PR 构建独立交付，不回退上述 A/BCD 基线或 Memory 修复。
+
 ## 深入了解
 
 [使用指南](src/docs/overview.md) · [运行参考](src/docs/protocol.md) · [Python 终端](src/docs/python-terminal.md) · [开发与贡献](CONTRIBUTING.md)

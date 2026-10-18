@@ -141,7 +141,9 @@ function TaskBoardInner() {
               {liveRun.syncError}
             </p>
           )}
-          <ProgressRibbon phases={phaseSegments(nodes, activeNodeId ?? undefined)} />
+          <ProgressRibbon
+            phases={phaseSegments(nodes, activeTask?.contractRunId ? mission.state : undefined)}
+          />
         </div>
 
         <div className="flex min-h-0 flex-1 flex-col">

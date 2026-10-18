@@ -247,7 +247,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       openPhase(driverMilestoneSpan('driver.spawn'));
       openPhase(driverMilestoneSpan('driver.first_output'));
       openPhase(driverMilestoneSpan('driver.event_channel'));
-      const child = spawn(this.command, this.args, this.spawnOptions());
+      const child = spawn(this.command, this.args, this.spawnOptions(input));
       this.activeChildren.set(input.run_id, child);
       child.once('spawn', () => closePhase(driverMilestoneSpan('driver.spawn')));
 
@@ -530,7 +530,7 @@ export class CommandDriverTransport implements ExternalDriverTransport {
     }
   }
 
-  private spawnOptions(): SpawnOptionsWithoutStdio {
+  private spawnOptions(input: DriverPrompt): SpawnOptionsWithoutStdio {
     const options: SpawnOptionsWithoutStdio = {
       stdio: ['pipe', 'pipe', 'pipe'],
     };
@@ -551,10 +551,13 @@ export class CommandDriverTransport implements ExternalDriverTransport {
       options.cwd = this.cwd;
     }
 
-    if (this.env !== undefined || this.unsetEnv.length > 0) {
-      const env = {
+    if (this.env !== undefined || this.unsetEnv.length > 0 || input.workspace_path) {
+      const env: NodeJS.ProcessEnv = {
         ...process.env,
         ...(this.env ?? {}),
+        // Tools inherit this variable too; it must describe this invocation,
+        // not the backend's project root when executing in a Council sandbox.
+        ...(input.workspace_path ? { ACP_WORKSPACE: input.workspace_path } : {}),
       };
       for (const key of this.unsetEnv) {
         delete env[key];

@@ -32,6 +32,7 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { generateText, jsonSchema, type LanguageModel } from 'ai';
 import { LiteLLMClient } from '../../litellm';
+import { createCredentiallessAnthropicProvider } from '../../litellm/credentialless-anthropic-provider';
 import type { Tool, ToolCall } from '../../litellm';
 import { recordProxyLlmUsage } from '../../telemetry/llm-usage-ledger';
 import type {
@@ -98,6 +99,11 @@ async function resolveProviderModel(provider: string, modelId: string): Promise<
       }).chat(modelId) as LanguageModel;
     }
     case 'anthropic': {
+      if (process.env.NEWIDE_LLM_CREDENTIALLESS === '1') {
+        const baseURL = process.env.NEWIDE_LLM_BASE_URL?.trim();
+        if (!baseURL) throw new Error('Local proxy requires NEWIDE_LLM_BASE_URL');
+        return createCredentiallessAnthropicProvider(baseURL).messages(modelId);
+      }
       const { createAnthropic } = await import('@ai-sdk/anthropic');
       const apiKey =
         process.env.ANTHROPIC_AUTH_TOKEN ||
@@ -251,7 +257,12 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
       registeredTasks.includes(this.taskName) ? this.taskName : DEFAULT_TASK_NAME,
     );
 
-    if (this.modelOverride) {
+    if (process.env.NEWIDE_LLM_CREDENTIALLESS === '1') {
+      const proxyModel = process.env.NEWIDE_LLM_MODEL?.trim();
+      if (!proxyModel) throw new Error('Local proxy requires NEWIDE_LLM_MODEL');
+      providerName = 'anthropic';
+      modelId = proxyModel;
+    } else if (this.modelOverride) {
       providerName = preferAnthropicCompat() ? 'anthropic' : 'openai';
       modelId = this.modelOverride;
     } else {
@@ -351,7 +362,7 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
       model,
       ...(systemParts.length > 0 ? { system: systemParts.join('\n\n') } : {}),
       messages: aiMessages,
-      temperature,
+      ...(process.env.NEWIDE_LLM_CREDENTIALLESS === '1' ? {} : { temperature }),
       maxOutputTokens: maxTokens,
     };
     if (liteTools.length > 0) {
